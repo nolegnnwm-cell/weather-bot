@@ -1,0 +1,203 @@
+import requests
+import sqlite3
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, filters, ContextTypes
+)
+
+BOT_TOKEN = "ВАШ_ТОКЕН_БОТА"
+WEATHER_API_KEY = "ВАШ_КЛЮЧ_OPENWEATHERMAP"
+
+WEATHER_ICONS = {
+    "Clear": "☀️", "Clouds": "☁️", "Rain": "🌧️",
+    "Drizzle": "🌦️", "Thunderstorm": "⛈️", "Snow": "❄️",
+    "Mist": "🌫️", "Fog": "🌫️", "Haze": "🌫️"
+}
+
+# ─── База данных ───────────────────────────────────────────
+
+def init_db():
+    conn = sqlite3.connect("cities.db")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS saved_cities (
+            user_id INTEGER PRIMARY KEY,
+            city TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def save_city(user_id: int, city: str):
+    conn = sqlite3.connect("cities.db")
+    conn.execute("""
+        INSERT INTO saved_cities (user_id, city) VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET city = excluded.city
+    """, (user_id, city))
+    conn.commit()
+    conn.close()
+
+def get_saved_city(user_id: int):
+    conn = sqlite3.connect("cities.db")
+    row = conn.execute(
+        "SELECT city FROM saved_cities WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+# ─── Погода ────────────────────────────────────────────────
+
+def fetch_weather(city: str):
+    url = "https://api.openweathermap.org/data/2.5/forecast"
+    params = {
+        "q": city,
+        "appid": WEATHER_API_KEY,
+        "units": "metric",
+        "lang": "ru"
+    }
+    response = requests.get(url, params=params)
+    return response.json()
+
+def format_forecast(data: dict):
+    days = {}
+    for item in data["list"]:
+        date = datetime.fromtimestamp(item["dt"])
+        day_key = date.strftime("%Y-%m-%d")
+        hour = date.hour
+        if day_key not in days or abs(hour - 12) < abs(datetime.fromtimestamp(days[day_key]["dt"]).hour - 12):
+            days[day_key] = item
+
+    city_name = data["city"]["name"]
+    country = data["city"]["country"]
+    message = f"🌍 *{city_name}, {country}* — прогноз на неделю\n"
+    message += "─" * 28 + "\n"
+
+    for day_key in sorted(days.keys())[:7]:
+        item = days[day_key]
+        date = datetime.fromtimestamp(item["dt"])
+        temp        = round(item["main"]["temp"])
+        temp_min    = round(item["main"]["temp_min"])
+        temp_max    = round(item["main"]["temp_max"])
+        feels_like  = round(item["main"]["feels_like"])
+        description = item["weather"][0]["description"].capitalize()
+        main_weather= item["weather"][0]["main"]
+        humidity    = item["main"]["humidity"]
+        wind        = round(item["wind"]["speed"])
+        icon = WEATHER_ICONS.get(main_weather, "🌡️")
+
+        message += (
+            f"\n{icon} *{date.strftime('%d.%m')}*\n"
+            f"  🌡 {temp}°C (мин {temp_min}° / макс {temp_max}°)\n"
+            f"  🤔 Ощущается: {feels_like}°C\n"
+            f"  📋 {description}\n"
+            f"  💧 Влажность: {humidity}%\n"
+            f"  💨 Ветер: {wind} м/с\n"
+        )
+
+    return message
+
+# ─── Хендлеры ──────────────────────────────────────────────
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    saved = get_saved_city(user_id)
+    saved_hint = f"\n\n⭐ Твой сохранённый город: *{saved}*\nОтправь /saved чтобы сразу получить прогноз." if saved else ""
+
+    await update.message.reply_text(
+        f"👋 Привет! Я бот погоды.\n\n"
+        f"Напиши название города — покажу прогноз на 7 дней 🌍{saved_hint}",
+        parse_mode="Markdown"
+    )
+
+async def get_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    city = update.message.text.strip()
+    user_id = update.effective_user.id
+    await update.message.reply_text(f"🔍 Ищу погоду для «{city}»...")
+
+    data = fetch_weather(city)
+
+    if data.get("cod") != "200":
+        await update.message.reply_text("❌ Город не найден. Проверь название и попробуй снова.")
+        return
+
+    message = format_forecast(data)
+
+    # Проверяем — уже сохранён этот город или нет
+    saved = get_saved_city(user_id)
+    real_city_name = data["city"]["name"]
+
+    if saved and saved.lower() == real_city_name.lower():
+        keyboard = [[InlineKeyboardButton("✅ Город уже сохранён", callback_data="already_saved")]]
+    else:
+        keyboard = [[InlineKeyboardButton("⭐ Сохранить город", callback_data=f"save:{real_city_name}")]]
+
+    await update.message.reply_text(
+        message,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def saved_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    city = get_saved_city(user_id)
+
+    if not city:
+        await update.message.reply_text(
+            "У тебя нет сохранённого города.\n\n"
+            "Введи любой город — и нажми кнопку ⭐ под прогнозом."
+        )
+        return
+
+    await update.message.reply_text(f"🔍 Загружаю прогноз для «{city}»...")
+    data = fetch_weather(city)
+
+    if data.get("cod") != "200":
+        await update.message.reply_text(f"❌ Не удалось получить погоду для «{city}».")
+        return
+
+    message = format_forecast(data)
+    keyboard = [[InlineKeyboardButton("🗑 Удалить сохранённый город", callback_data="delete_saved")]]
+
+    await update.message.reply_text(
+        message,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()  # убирает "часики" на кнопке
+    user_id = query.from_user.id
+    data = query.data
+
+    if data.startswith("save:"):
+        city = data.split("save:")[1]
+        save_city(user_id, city)
+        # Меняем кнопку на "✅ Сохранено"
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Сохранено!", callback_data="already_saved")
+            ]])
+        )
+
+    elif data == "already_saved":
+        await query.answer("Этот город уже сохранён ⭐", show_alert=False)
+
+    elif data == "delete_saved":
+        conn = sqlite3.connect("cities.db")
+        conn.execute("DELETE FROM saved_cities WHERE user_id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("🗑 Сохранённый город удалён.")
+
+# ─── Запуск ────────────────────────────────────────────────
+
+init_db()
+app = ApplicationBuilder().token(BOT_TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("saved", saved_command))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, get_weather))
+app.add_handler(CallbackQueryHandler(button_handler))
+app.run_polling()
